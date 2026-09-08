@@ -1,0 +1,458 @@
+from datetime import datetime, timedelta, timezone
+import json
+import os
+import re
+import threading
+import time
+from flask import Flask
+import google.genai as genai
+import telebot
+from telebot import types
+
+# --- RENDER UCHUN FLASK VEB-SERVER (HEALTH CHECK) ---
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Bot status: Alive and Running!"
+
+
+def run_flask():
+    # Render avtomatik ajratadigan PORT ni oladi
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+
+# Flask serverni alohida oqimda (thread) ishga tushirish
+threading.Thread(target=run_flask, daemon=True).start()
+
+# --- ASOSIY SOZLAMALAR ---
+# Tokenlarni xavfsizlik uchun Environment Variable'dan olamiz
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN", "8738381855:AAFqz-oxA5CpqnyA7a3GUSZhjpWQO8BUMuk"
+)
+GEMINI_API_KEY = os.environ.get(
+    "GEMINI_API_KEY", "AQ.Ab8RN6JfE9hOmjN9N8VSl_cb1XV90BRCbQiJwd1lpdRuozjO7g"
+)
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 8216291475))
+CHANNELS = ["@S001CAR"]
+
+bot = telebot.TeleBot(BOT_TOKEN)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+TASKS_FILE = "tasks.json"
+
+
+# --- YORDAMCHI FUNKSIYALAR ---
+def clean_markdown(text):
+    if not text:
+        return ""
+    for char in ["_", "*", "`", "[", "]"]:
+        text = str(text).replace(char, f"\\{char}")
+    return text
+
+
+def get_uzb_time():
+    uzb_tz = timezone(timedelta(hours=5))
+    return datetime.now(uzb_tz)
+
+
+def safe_send_message(chat_id, text, **kwargs):
+    try:
+        return bot.send_message(chat_id, text, **kwargs)
+    except Exception as e:
+        print(f"Xabar yuborishda xatolik: {e}")
+        return None
+
+
+def load_tasks():
+    if os.path.exists(TASKS_FILE):
+        try:
+            with open(TASKS_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    return {}
+                return json.loads(content)
+        except Exception as e:
+            print(f"Fayl o'qishda xatolik: {e}")
+    return {}
+
+
+def save_tasks(tasks):
+    try:
+        with open(TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Fayl saqlashda xatolik: {e}")
+
+
+def check_sub(user_id):
+    if user_id == ADMIN_ID:
+        return True
+
+    for channel in CHANNELS:
+        try:
+            member = bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception as e:
+            print(f"Kanalni tekshirishda xatolik: {e}")
+            return True
+    return True
+
+
+# --- TUGMALAR ---
+def main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📋 Vazifalarim", "➕ Vazifa qo'shish")
+    markup.row("🗑 Barcha vazifalarni tozalash")
+    return markup
+
+
+def sub_keyboard():
+    markup = types.InlineKeyboardMarkup()
+    for channel in CHANNELS:
+        btn = types.InlineKeyboardButton(
+            text="📢 Kanalga a'zo bo'lish",
+            url=f"https://t.me/{channel.replace('@', '')}",
+        )
+        markup.add(btn)
+
+    check_btn = types.InlineKeyboardButton(
+        text="✅ A'zo bo'ldim / Tekshirish", callback_data="check_subscriptions"
+    )
+    markup.add(check_btn)
+    return markup
+
+
+# --- AVTOMATIK ESLATISH TIZIMI ---
+def reminder_checker():
+    while True:
+        try:
+            now_str = get_uzb_time().strftime("%Y-%m-%d %H:%M")
+            tasks_data = load_tasks()
+            updated = False
+
+            for user_id, content in list(tasks_data.items()):
+                user_tasks = (
+                    content
+                    if isinstance(content, list)
+                    else content.get("tasks", [])
+                )
+                remaining_tasks = []
+
+                for task in user_tasks:
+                    if task.get("remind_at") and task["remind_at"] <= now_str:
+                        res = safe_send_message(
+                            int(user_id),
+                            f"⏰ **ESLATMA!**\n\n📌 **Vazifa:** {clean_markdown(task['text'])}\n\nVaqti bo'ldi, bajarishni unutmang!",
+                            parse_mode="Markdown",
+                        )
+                        if res:
+                            updated = True
+                        else:
+                            remaining_tasks.append(task)
+                    else:
+                        remaining_tasks.append(task)
+
+                if isinstance(content, list):
+                    tasks_data[user_id] = remaining_tasks
+                else:
+                    tasks_data[user_id]["tasks"] = remaining_tasks
+
+            if updated:
+                save_tasks(tasks_data)
+        except Exception as e:
+            print(f"Eslatishda xatolik: {e}")
+
+        time.sleep(10)
+
+
+threading.Thread(target=reminder_checker, daemon=True).start()
+
+
+# --- BOT HANDLERLARI ---
+@bot.message_handler(func=lambda message: not check_sub(message.chat.id))
+def subscribe_reminder(message):
+    safe_send_message(
+        message.chat.id,
+        "⚠️ **Botdan foydalanish uchun quyidagi kanalimizga a'zo bo'ling:**",
+        parse_mode="Markdown",
+        reply_markup=sub_keyboard(),
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "check_subscriptions"
+)
+def check_callback(call):
+    try:
+        if check_sub(call.message.chat.id):
+            bot.answer_callback_query(
+                call.id, "✅ Rahmat! Endi botdan foydalanishingiz mumkin."
+            )
+            try:
+                bot.delete_message(
+                    call.message.chat.id, call.message.message_id
+                )
+            except Exception:
+                pass
+            safe_send_message(
+                call.message.chat.id,
+                "Xush kelibsiz! Buyruqlardan birini tanlang:",
+                reply_markup=main_keyboard(),
+            )
+        else:
+            bot.answer_callback_query(
+                call.id, "❌ Siz hali kanalga a'zo bo'lmadingiz!", show_alert=True
+            )
+    except Exception as e:
+        print(f"Callback xatoligi: {e}")
+
+
+@bot.message_handler(commands=["start"])
+def start_message(message):
+    welcome_text = (
+        f"Salom, {clean_markdown(message.from_user.first_name)}! 👋\n\n"
+        "Men sizning **Aqlli Eslatuvchi va Vazifalar Yordamchingizaman**.\n"
+        "Menga vazifa va vaqtni yozing (Masalan: *Bugun 21:50 da dars qilaman*), men sizga o'sha vaqtda eslatma yuboraman!"
+    )
+    safe_send_message(
+        message.chat.id,
+        welcome_text,
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(),
+    )
+
+
+@bot.message_handler(commands=["stat"])
+def show_stats(message):
+    if message.chat.id == ADMIN_ID:
+        tasks_data = load_tasks()
+        user_count = len(tasks_data.keys())
+
+        total_tasks = 0
+        for content in tasks_data.values():
+            if isinstance(content, list):
+                total_tasks += len(content)
+            else:
+                total_tasks += len(content.get("tasks", []))
+
+        msg = (
+            f"📊 **Bot Statistikasi:**\n\n"
+            f"👤 Foydalanuvchilar soni: **{user_count} ta**\n"
+            f"📌 Jami faol vazifalar: **{total_tasks} ta**\n\n"
+            f"💡 *Barcha foydalanuvchilar vazifalarini ko'rish uchun* `/users` *buyrug'ini yuboring.*"
+        )
+        safe_send_message(message.chat.id, msg, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["users"])
+def show_users_details(message):
+    if message.chat.id == ADMIN_ID:
+        tasks_data = load_tasks()
+
+        if not tasks_data:
+            safe_send_message(
+                message.chat.id, "📭 Hali hech qanday foydalanuvchi yo'q."
+            )
+            return
+
+        report = "👥 **Foydalanuvchilar va ularning vazifalari:**\n\n"
+
+        for user_id, content in tasks_data.items():
+            if isinstance(content, list):
+                user_name = (
+                    f"👤 [Foydalanuvchi](tg://user?id={user_id}) (ID:"
+                    f" `{user_id}`)"
+                )
+                user_tasks = content
+            else:
+                raw_name = content.get("name", "Foydalanuvchi")
+                name_val = clean_markdown(raw_name)
+                user_name = (
+                    f"👤 [{name_val}](tg://user?id={user_id}) (ID: `{user_id}`)"
+                )
+                user_tasks = content.get("tasks", [])
+
+            report += f"{user_name}\n"
+
+            if user_tasks:
+                for idx, task in enumerate(user_tasks, 1):
+                    t_time = (
+                        f" [⏰ {task['remind_at']}]"
+                        if task.get("remind_at")
+                        else ""
+                    )
+                    task_txt = clean_markdown(task["text"])
+                    report += f"   └ {idx}. {task_txt}{t_time}\n"
+            else:
+                report += "   └ (Faol vazifalar yo'q)\n"
+
+            report += "\n--------------------\n\n"
+
+        safe_send_message(message.chat.id, report, parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda message: message.text == "📋 Vazifalarim")
+def show_tasks(message):
+    user_id = str(message.chat.id)
+    tasks_data = load_tasks()
+
+    content = tasks_data.get(user_id, [])
+    user_tasks = (
+        content if isinstance(content, list) else content.get("tasks", [])
+    )
+
+    if not user_tasks:
+        safe_send_message(
+            message.chat.id,
+            "🎉 Sizda hozircha hech qanday vazifa yo'q!",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    text = "📋 **Sizning vazifalaringiz ro'yxati:**\n\n"
+    markup = types.InlineKeyboardMarkup()
+
+    for idx, task in enumerate(user_tasks, 1):
+        time_info = (
+            f" (⏰ {task['remind_at']})" if task.get("remind_at") else ""
+        )
+        task_txt = clean_markdown(task["text"])
+        text += f"{idx}. {task_txt}{time_info}\n"
+        markup.add(
+            types.InlineKeyboardButton(
+                f"✅ {idx}-vazifani bajarildi deb belgilash",
+                callback_data=f"done_{idx-1}",
+            )
+        )
+
+    safe_send_message(
+        message.chat.id, text, parse_mode="Markdown", reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
+def complete_task(call):
+    user_id = str(call.message.chat.id)
+    task_idx = int(call.data.split("_")[1])
+    tasks_data = load_tasks()
+
+    content = tasks_data.get(user_id, [])
+    user_tasks = (
+        content if isinstance(content, list) else content.get("tasks", [])
+    )
+
+    if 0 <= task_idx < len(user_tasks):
+        completed = user_tasks.pop(task_idx)
+
+        if isinstance(content, list):
+            tasks_data[user_id] = user_tasks
+        else:
+            tasks_data[user_id]["tasks"] = user_tasks
+
+        save_tasks(tasks_data)
+
+        try:
+            bot.answer_callback_query(call.id, "Vazifa bajarildi!")
+            bot.edit_message_text(
+                f"✅ **Bajarildi:** {clean_markdown(completed['text'])}",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"Bajarildi belgilashda xatolik: {e}")
+
+
+@bot.message_handler(
+    func=lambda message: message.text == "🗑 Barcha vazifalarni tozalash"
+)
+def clear_tasks(message):
+    user_id = str(message.chat.id)
+    tasks_data = load_tasks()
+
+    if user_id in tasks_data:
+        if isinstance(tasks_data[user_id], list):
+            tasks_data[user_id] = []
+        else:
+            tasks_data[user_id]["tasks"] = []
+        save_tasks(tasks_data)
+
+    safe_send_message(
+        message.chat.id,
+        "🗑 Barcha vazifalaringiz tozalandi!",
+        reply_markup=main_keyboard(),
+    )
+
+
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    if message.text == "➕ Vazifa qo'shish":
+        safe_send_message(
+            message.chat.id,
+            "Yangi vazifangiz matnini yuboring (Masalan: *Bugun 21:50 da dars qilish kerak*):",
+            parse_mode="Markdown",
+        )
+        return
+
+    user_id = str(message.chat.id)
+    user_full_name = message.from_user.first_name or "Foydalanuvchi"
+    if message.from_user.username:
+        user_full_name += f" (@{message.from_user.username})"
+
+    task_text = message.text
+    now = get_uzb_time()
+
+    time_match = re.search(r"(\d{1,2}):(\d{2})", task_text)
+
+    remind_at_str = None
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+
+        target_time = now.replace(hour=hour, minute=minute, second=0)
+        if target_time < now:
+            target_time += timedelta(days=1)
+
+        remind_at_str = target_time.strftime("%Y-%m-%d %H:%M")
+
+    tasks_data = load_tasks()
+
+    if user_id not in tasks_data or isinstance(tasks_data[user_id], list):
+        existing_tasks = (
+            tasks_data[user_id]
+            if user_id in tasks_data and isinstance(tasks_data[user_id], list)
+            else []
+        )
+        tasks_data[user_id] = {"name": user_full_name, "tasks": existing_tasks}
+
+    tasks_data[user_id]["name"] = user_full_name
+
+    task_obj = {"text": task_text, "remind_at": remind_at_str}
+    tasks_data[user_id]["tasks"].append(task_obj)
+    save_tasks(tasks_data)
+
+    msg = f"📌 **Vazifa saqlandi:** {clean_markdown(task_text)}\n"
+    if remind_at_str:
+        msg += f"⏰ **Eslatma vaqti o'rnatildi:** {remind_at_str}"
+    else:
+        msg += "⚠️ (Vaqt topilmadi. Soatni HH:MM formatida yozing)"
+
+    safe_send_message(
+        message.chat.id, msg, parse_mode="Markdown", reply_markup=main_keyboard()
+    )
+
+
+print("Aqlli Eslatuvchi Boti ishga tushirilmoqda...")
+
+while True:
+    try:
+        bot.get_me()
+        print("Bot muvaffaqiyatli ulandi va ishlamoqda...")
+        bot.polling(non_stop=True, interval=2, timeout=20)
+    except Exception as e:
+        print(f"Tarmoqda xatolik yuz berdi: {e}\n5 soniyadan so'ng qayta uriniladi...")
+        time.sleep(5)
